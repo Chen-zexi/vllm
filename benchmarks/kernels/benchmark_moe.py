@@ -551,7 +551,7 @@ def save_configs(
     use_int8_w8a16: bool,
     block_quant_shape: list[int],
     enable_expert_parallel: bool = False,
-    tp_size: int = 1,
+    ep_size: int = 1,
 ) -> None:
     dtype_str = get_config_dtype_str(
         dtype, use_int8_w8a16=use_int8_w8a16, use_fp8_w8a8=use_fp8_w8a8
@@ -562,7 +562,7 @@ def save_configs(
     
     if enable_expert_parallel:
         # Expert parallel uses local expert count per device
-        local_num_experts = num_experts // tp_size
+        local_num_experts = num_experts // ep_size
         filename = get_config_file_name(
             local_num_experts, shard_intermediate_size // 2, dtype_str, block_quant_shape
         )
@@ -677,12 +677,21 @@ def main(args: argparse.Namespace):
         os.environ["ROCR_VISIBLE_DEVICES"] = val
         del os.environ["HIP_VISIBLE_DEVICES"]
 
+    ray.init()
+    num_gpus = int(ray.available_resources()["GPU"])
+
     if args.enable_expert_parallel:
+        if args.tp_size != num_gpus:
+            raise ValueError(
+                "When running with --enable-expert-parallel, the specified "
+                "--tp-size must be equal to the number of available GPUs. "
+                f"Got --tp-size={args.tp_size} and {num_gpus} GPUs.\n"
+                "To tune for a specific number of GPUs for expert parallel, "
+                "please restrict the visible devices using the CUDA_VISIBLE_DEVICES"
+            )
         if args.tp_size < 2:
             raise ValueError("Expert parallel requires tensor parallel size >= 2")
 
-    ray.init()
-    num_gpus = int(ray.available_resources()["GPU"])
     workers = [BenchmarkWorker.remote(
         args.seed, 
         args.enable_expert_parallel,
