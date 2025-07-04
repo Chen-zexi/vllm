@@ -388,7 +388,13 @@ def merge_unique_dicts(list1, list2):
 
 @ray.remote(num_gpus=1)
 class BenchmarkWorker:
-    def __init__(self, seed: int, enable_expert_parallel: bool = False, worker_id: int = 0, total_workers: int = 1) -> None:
+    def __init__(
+        self,
+        seed: int,
+        enable_expert_parallel: bool = False,
+        worker_id: int = 0,
+        total_workers: int = 1,
+    ) -> None:
         torch.set_default_device("cuda")
         current_platform.seed_everything(seed)
         self.seed = seed
@@ -564,11 +570,11 @@ def save_configs(
         # Expert parallel uses local expert count per device
         local_num_experts = num_experts // ep_size
         filename = get_config_file_name(
-            local_num_experts, shard_intermediate_size // 2, dtype_str, block_quant_shape
+            local_num_experts, shard_intermediate_size//2, dtype_str, block_quant_shape
         )
     else:
         filename = get_config_file_name(
-            num_experts, shard_intermediate_size // 2, dtype_str, block_quant_shape
+            num_experts, shard_intermediate_size//2, dtype_str, block_quant_shape
         )
 
     print(f"Writing best config to {filename}...")
