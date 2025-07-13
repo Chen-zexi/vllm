@@ -12,15 +12,41 @@ from typing import Any, TypedDict
 
 import ray
 import torch
+import torch.distributed as dist
 from ray.experimental.tqdm_ray import tqdm
 
 from vllm.model_executor.layers.fused_moe.fused_moe import *
 from vllm.platforms import current_platform
 from vllm.transformers_utils.config import get_config
 from vllm.triton_utils import triton
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils import FlexibleArgumentParser, get_open_port
 
 FP8_DTYPE = current_platform.fp8_dtype()
+
+
+def build_expert_map(global_num_experts: int, 
+                    ep_size: int,
+                    ep_rank: int) -> tuple[int, torch.Tensor]:
+    """Build expert map for expert parallel. Returns (local_num_experts, expert_map)."""
+    # Calculate base number of experts per rank
+    base_experts = global_num_experts // ep_size
+    
+    # Create expert map
+    expert_map = torch.full((global_num_experts,), -1, dtype=torch.int32)
+    
+    if ep_rank < (ep_size - 1):
+        # Non-last ranks get base number of experts
+        local_num_experts = base_experts
+        start = ep_rank * base_experts
+        end = start + local_num_experts
+        expert_map[start:end] = torch.arange(local_num_experts, dtype=torch.int32)
+    else:
+        # Last rank gets all remaining experts
+        start = ep_rank * base_experts
+        local_num_experts = global_num_experts - start
+        expert_map[start:] = torch.arange(local_num_experts, dtype=torch.int32)
+    
+    return local_num_experts, expert_map.cuda()
 
 
 class BenchmarkConfig(TypedDict):
@@ -47,20 +73,25 @@ def benchmark_config(
     use_deep_gemm: bool = False,
     enable_expert_parallel: bool = False,
     ep_size: int = 1,
+    ep_rank: int = 0,
 ) -> float:
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
     
-    # For expert parallel, only create weights for local experts
+    # For expert parallel, calculate local and global expert counts
+    global_num_experts = num_experts
     if enable_expert_parallel:
-        num_experts = num_experts // ep_size
+        local_num_experts, expert_map = build_expert_map(global_num_experts, ep_size, ep_rank)
+    else:
+        local_num_experts = num_experts
+        expert_map = None
     
     if use_int8_w8a16:
         w1 = torch.randint(
             -127,
             127,
             (
-                num_experts,
+                local_num_experts,
                 shard_intermediate_size,
                 hidden_size,
             ),
@@ -70,7 +101,7 @@ def benchmark_config(
             -127,
             127,
             (
-                num_experts,
+                local_num_experts,
                 hidden_size,
                 shard_intermediate_size // 2,
             ),
@@ -78,12 +109,13 @@ def benchmark_config(
         )
     else:
         w1 = torch.randn(
-            num_experts, shard_intermediate_size, hidden_size, dtype=init_dtype
+            local_num_experts, shard_intermediate_size, hidden_size, dtype=init_dtype
         )
         w2 = torch.randn(
-            num_experts, hidden_size, shard_intermediate_size // 2, dtype=init_dtype
+            local_num_experts, hidden_size, shard_intermediate_size // 2, dtype=init_dtype
         )
-    gating_output = torch.randn(num_iters, num_tokens, num_experts, dtype=torch.float32)
+    # Gating output uses global number of experts
+    gating_output = torch.randn(num_iters, num_tokens, global_num_experts, dtype=torch.float32)
 
     w1_scale = None
     w2_scale = None
@@ -91,13 +123,16 @@ def benchmark_config(
     a2_scale = None
     if use_int8_w8a16:
         w1_scale = torch.randn(
-            (num_experts, 2 * shard_intermediate_size), dtype=torch.float32
+            (local_num_experts, 2 * shard_intermediate_size), dtype=torch.float32
         )
-        w2_scale = torch.randn((hidden_size, num_experts), dtype=torch.float32)
+        w2_scale = torch.randn((hidden_size, local_num_experts), dtype=torch.float32)
+    if use_deep_gemm:
+        # we use the default block shape for deepgemm
+        block_quant_shape = [128, 128]
     if use_fp8_w8a8:
         if block_quant_shape:
             block_n, block_k = block_quant_shape[0], block_quant_shape[1]
-            E = num_experts
+            E = local_num_experts
             N = shard_intermediate_size // 2
             K = hidden_size
             factor_for_scale = 1e-2
@@ -114,8 +149,8 @@ def benchmark_config(
                 * factor_for_scale
             )
         else:
-            w1_scale = torch.randn(num_experts, dtype=torch.float32)
-            w2_scale = torch.randn(num_experts, dtype=torch.float32)
+            w1_scale = torch.randn(local_num_experts, dtype=torch.float32)
+            w2_scale = torch.randn(local_num_experts, dtype=torch.float32)
 
         a1_scale = torch.randn(1, dtype=torch.float32)
         a2_scale = torch.randn(1, dtype=torch.float32)
@@ -123,7 +158,7 @@ def benchmark_config(
         w1 = w1.to(FP8_DTYPE)
         w2 = w2.to(FP8_DTYPE)
 
-    input_gating = torch.empty(num_tokens, num_experts, dtype=torch.float32)
+    input_gating = torch.empty(num_tokens, global_num_experts, dtype=torch.float32)
 
     def prepare(i: int):
         input_gating.copy_(gating_output[i])
@@ -150,6 +185,8 @@ def benchmark_config(
                     a2_scale=a2_scale,
                     block_shape=block_quant_shape,
                     allow_deep_gemm=True,
+                    global_num_experts=global_num_experts,
+                    expert_map=expert_map,
                 )
             else:
                 fused_moe(
@@ -167,6 +204,8 @@ def benchmark_config(
                     a1_scale=a1_scale,
                     a2_scale=a2_scale,
                     block_shape=block_quant_shape,
+                    global_num_experts=global_num_experts,
+                    expert_map=expert_map,
                 )
 
     # JIT compilation & warmup
@@ -407,7 +446,41 @@ class BenchmarkWorker:
         # Get the device ID to allocate tensors and kernels
         # on the respective GPU. This is required for Ray to work
         # correctly with multi-GPU tuning on the ROCm platform.
-        self.device_id = int(ray.get_gpu_ids()[0])
+        gpu_ids = ray.get_gpu_ids()
+        if gpu_ids:
+            self.device_id = int(gpu_ids[0])
+        else:
+            self.device_id = 0
+        self.distributed_initialized = False
+
+    def init_distributed(self, master_addr: str, master_port: int) -> None:
+        """Initialize torch.distributed for expert parallel."""
+        if self.distributed_initialized:
+            return
+        
+        os.environ['MASTER_ADDR'] = master_addr
+        os.environ['MASTER_PORT'] = str(master_port)
+        os.environ['RANK'] = str(self.worker_id)
+        os.environ['WORLD_SIZE'] = str(self.total_workers)
+        
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend='nccl',
+                world_size=self.total_workers,
+                rank=self.worker_id
+            )
+        
+        self.distributed_initialized = True
+        
+        # Set device using local device ID
+        # Ray workers see their assigned GPU as device 0
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            torch.cuda.set_device(0)
+
+    def get_node_ip(self) -> str:
+        """Get the IP address of this worker node."""
+        import socket
+        return socket.gethostbyname(socket.gethostname())
 
     def benchmark(
         self,
@@ -458,6 +531,7 @@ class BenchmarkWorker:
             use_deep_gemm=use_deep_gemm,
             enable_expert_parallel=self.enable_expert_parallel,
             ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
         )
         return config, kernel_time
 
@@ -512,6 +586,7 @@ class BenchmarkWorker:
                         use_deep_gemm=use_deep_gemm,
                         enable_expert_parallel=self.enable_expert_parallel,
                         ep_size=self.ep_size,
+                        ep_rank=self.ep_rank,
                     )
                 except triton.runtime.autotuner.OutOfResources:
                     # Some configurations may be invalid and fail to compile.
@@ -578,6 +653,7 @@ def save_configs(
         )
 
     print(f"Writing best config to {filename}...")
+    
     with open(filename, "w") as f:
         json.dump(configs, f, indent=4)
         f.write("\n")
@@ -689,11 +765,12 @@ def main(args: argparse.Namespace):
     if args.enable_expert_parallel:
         if args.tp_size != num_gpus:
             raise ValueError(
-                "When running with --enable-expert-parallel, the specified "
-                "--tp-size must be equal to the number of available GPUs. "
+                "When running with --enable-expert-parallel, the EP size is "
+                "automatically set to the number of available GPUs, and --tp-size "
+                "must match this value for correct benchmarking. "
                 f"Got --tp-size={args.tp_size} and {num_gpus} GPUs.\n"
-                "To tune for a specific number of GPUs for expert parallel, "
-                "please restrict the visible devices using the CUDA_VISIBLE_DEVICES"
+                "To benchmark with a specific EP size, please restrict the visible "
+                "devices using CUDA_VISIBLE_DEVICES environment variable."
             )
         if args.tp_size < 2:
             raise ValueError("Expert parallel requires tensor parallel size >= 2")
@@ -704,6 +781,23 @@ def main(args: argparse.Namespace):
         worker_id=i,
         total_workers=num_gpus
     ) for i in range(num_gpus)]
+
+    # Initialize distributed communication for expert parallel
+    if args.enable_expert_parallel:
+        # Get worker IPs to determine master
+        worker_ips = ray.get([w.get_node_ip.remote() for w in workers])
+        
+        # Use first worker's IP as master
+        master_addr = worker_ips[0]
+        master_port = get_open_port()
+        
+        # Initialize distributed on all workers
+        init_futures = [
+            w.init_distributed.remote(master_addr, master_port)
+            for w in workers
+        ]
+        ray.get(init_futures)
+        print(f"Initialized distributed environment with master at {master_addr}:{master_port}")
 
     def _distribute(method: str, inputs: list[Any]) -> list[Any]:
         outputs = []
